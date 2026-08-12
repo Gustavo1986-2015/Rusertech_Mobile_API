@@ -1,4 +1,5 @@
 import crypto from 'node:crypto';
+import { waitUntil } from '@vercel/functions';
 import { query } from './db';
 import type { AuthContext } from './auth';
 import type { NotifiableEvent } from './telemetry';
@@ -28,11 +29,12 @@ export function after(promise: Promise<unknown>): void {
     console.error('[notifier] fallo despachando avisos:', err),
   );
   try {
-    // Import perezoso: en local @vercel/functions no tiene contexto de request.
-    const { waitUntil } = require('@vercel/functions');
+    // En Vercel, waitUntil() mantiene viva la función tras responder, así que
+    // el email/webhook NUNCA entra en el presupuesto de latencia del SOS.
     waitUntil(swallowed);
   } catch {
-    /* sin contexto Vercel: la promesa corre igual, solo que sin garantía */
+    // Fuera de Vercel (tests locales) no hay contexto de request: la promesa
+    // corre igual, solo que sin la garantía de waitUntil.
   }
 }
 
