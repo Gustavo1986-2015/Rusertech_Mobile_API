@@ -20,27 +20,37 @@ create extension if not exists "uuid-ossp";
 -- ---------------------------------------------------------------------
 
 create table if not exists tenants (
-  id          uuid primary key default gen_random_uuid(),
-  name        varchar not null,
-  created_at  timestamptz not null default now()
+  id            uuid primary key default gen_random_uuid(),
+  name          varchar not null,
+  slug          varchar not null,                        -- NOT NULL SIN default (real)
+  plan          varchar not null default 'starter',
+  status        varchar not null default 'active',
+  settings_json jsonb   not null default '{}'::jsonb,
+  created_at    timestamptz not null default now(),
+  updated_at    timestamptz not null default now()
 );
 
 create table if not exists avl_users (
   id            uuid primary key default gen_random_uuid(),
   tenant_id     uuid not null references tenants(id),
   user_avl_code varchar not null,
+  name          varchar not null,          -- NOT NULL SIN default (real)
   api_key       varchar not null unique,   -- índice avl_users_api_key_key
   is_active     boolean not null default true,
   created_at    timestamptz not null default now()
 );
 
 create table if not exists vehicles (
-  id           uuid primary key default gen_random_uuid(),
-  tenant_id    uuid not null references tenants(id),
-  plate        varchar not null,
-  is_blocked   boolean not null default false,
-  block_reason text,
-  created_at   timestamptz not null default now(),
+  id            uuid primary key default gen_random_uuid(),
+  tenant_id     uuid not null references tenants(id),
+  plate         varchar not null,
+  vehicle_type  varchar not null,          -- NOT NULL SIN default (real)
+  fuel_type     varchar not null,          -- NOT NULL SIN default (real)
+  status        varchar not null,          -- NOT NULL SIN default (real)
+  metadata_json jsonb   not null default '{}'::jsonb,
+  is_blocked    boolean not null default false,
+  block_reason  text,
+  created_at    timestamptz not null default now(),
   unique (tenant_id, plate)
 );
 
@@ -48,7 +58,8 @@ create table if not exists drivers (
   id         uuid primary key default gen_random_uuid(),
   tenant_id  uuid not null references tenants(id),
   document   varchar,                      -- NULLABLE en la base real
-  full_name  varchar,
+  full_name  varchar not null,             -- NOT NULL (real)
+  status     varchar not null,             -- NOT NULL SIN default (real)
   created_at timestamptz not null default now()
 );
 -- índice UNIQUE parcial: (tenant_id, document) where document is not null
