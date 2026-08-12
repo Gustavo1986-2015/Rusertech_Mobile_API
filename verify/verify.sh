@@ -262,6 +262,18 @@ req POST /api/v1/trips "{\"vehicleId\":\"$PLATE\",\"driverId\":\"$DNI\",\"planne
 assert_status 422 "$CODE" "solo se aceptan 2/4/6/10/12"
 
 # ---------------------------------------------------------------------
+# --- Setup del gate local: canal webhook apuntando al mock (idempotente). ---
+# Sin esto, las asertaciones de webhook del paso 12 no son reproducibles desde
+# el repo: el seed solo crea el canal email. Contra Vercel (sin PSQL) no aplica.
+if have_sql && [ -n "${MOCK_LOG:-}" ]; then
+  sql "insert into mobile_alert_channels (tenant_id, channel_type, target, secret, notify_codes, is_active)
+       select a.tenant_id, 'webhook', 'http://127.0.0.1:4010/webhook', 'secreto-de-prueba', '{MOB_SOS}', true
+         from avl_users a where a.api_key = '$APIKEY'
+          and not exists (select 1 from mobile_alert_channels
+                           where channel_type = 'webhook'
+                             and target = 'http://127.0.0.1:4010/webhook')" >/dev/null
+fi
+
 step "10. Evento MOB_SOS con viaje → telemetry + trip_events"
 EV_BEFORE=$(sql "select count(*) from trip_events where trip_id='$TRIP_ID'" || echo 0)
 START=$(date +%s%N)
