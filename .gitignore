@@ -5,3 +5,4 @@ node_modules/
 *.log
 .vercel
 .DS_Store
+tsconfig.tsbuildinfo
