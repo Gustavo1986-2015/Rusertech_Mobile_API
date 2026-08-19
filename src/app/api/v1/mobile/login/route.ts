@@ -22,6 +22,80 @@ interface ActivationRow {
   avl_is_active: boolean;
   user_avl_code: string;
   api_key: string;
+  tenant_id: string;
+}
+
+/** Fila de tenant_mobile_config (los CHECK de rango viven en la base). */
+interface ConfigRow {
+  heartbeat_interval_minutes: number;
+  stop_threshold_minutes: number;
+  interval_moving_seconds: number;
+  interval_idle_seconds: number;
+  min_displacement_meters: number;
+  max_accuracy_meters: number;
+  auto_resume_minutes: number;
+}
+
+/** Objeto `config` de la respuesta — contrato en CONTRATO_CONFIG_OPERATIVA.md. */
+interface OperationalConfig {
+  heartbeatIntervalMinutes: number;
+  stopThresholdMinutes: number;
+  intervalMovingSeconds: number;
+  intervalIdleSeconds: number;
+  minDisplacementMeters: number;
+  maxAccuracyMeters: number;
+  autoResumeMinutes: number;
+}
+
+/**
+ * Configuración operativa del tenant, para incluir en la respuesta del login.
+ *
+ * - Sin fila para el tenant → undefined → la clave `config` se OMITE de la
+ *   respuesta (ni null ni objeto vacío). Los defaults viven en la app:
+ *   duplicarlos acá crearía dos fuentes de verdad.
+ * - Cualquier fallo (tabla inaccesible, timeout) → undefined + error en el
+ *   log. Un problema de configuración jamás deja a un conductor sin poder
+ *   trabajar: el login responde igual.
+ *
+ * Query SEPARADA y no LEFT JOIN a propósito: con un JOIN, un problema en
+ * tenant_mobile_config voltearía la query de activación completa y el login
+ * entero. El costo es un round-trip extra SOLO en logins exitosos (el login
+ * ocurre una vez por registro, no está en el camino de la telemetría).
+ */
+async function fetchOperationalConfig(tenantId: string): Promise<OperationalConfig | undefined> {
+  try {
+    const { rows } = await query<ConfigRow>(
+      `select heartbeat_interval_minutes,
+              stop_threshold_minutes,
+              interval_moving_seconds,
+              interval_idle_seconds,
+              min_displacement_meters,
+              max_accuracy_meters,
+              auto_resume_minutes
+         from tenant_mobile_config
+        where tenant_id = $1
+        limit 1`,
+      [tenantId],
+    );
+    const row = rows[0];
+    if (!row) return undefined;
+    // snake_case (base) → camelCase (JSON), uno a uno.
+    return {
+      heartbeatIntervalMinutes: row.heartbeat_interval_minutes,
+      stopThresholdMinutes: row.stop_threshold_minutes,
+      intervalMovingSeconds: row.interval_moving_seconds,
+      intervalIdleSeconds: row.interval_idle_seconds,
+      minDisplacementMeters: row.min_displacement_meters,
+      maxAccuracyMeters: row.max_accuracy_meters,
+      autoResumeMinutes: row.auto_resume_minutes,
+    };
+  } catch (err) {
+    console.error(
+      '[login] config operativa no disponible (el login sigue sin config):',
+      (err as Error).message,
+    );
+    return undefined;
+  }
 }
 
 /**
@@ -44,8 +118,10 @@ export const POST = guarded(async (req: Request) => {
   }
 
   // activation_code es UNIQUE GLOBAL: el login no conoce el tenant.
+  // ma.tenant_id sale de acá mismo: es lo que la config operativa necesita.
   const { rows } = await query<ActivationRow>(
     `select ma.is_active,
+            ma.tenant_id,
             d.document      as driver_document,
             v.plate         as vehicle_plate,
             au.is_active    as avl_is_active,
@@ -81,5 +157,16 @@ export const POST = guarded(async (req: Request) => {
   }
 
   clearLoginAttempts(documentId);
-  return json({ avlUserCode: act.user_avl_code, apiKey: act.api_key }, 200);
+
+  // Solo en el login exitoso: los caminos 401/403/404 no pagan la query.
+  const config = await fetchOperationalConfig(act.tenant_id);
+  return json(
+    {
+      avlUserCode: act.user_avl_code,
+      apiKey: act.api_key,
+      // Sin fila o con fallo: la clave no existe en la respuesta.
+      ...(config ? { config } : {}),
+    },
+    200,
+  );
 });

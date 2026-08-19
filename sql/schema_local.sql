@@ -20,37 +20,27 @@ create extension if not exists "uuid-ossp";
 -- ---------------------------------------------------------------------
 
 create table if not exists tenants (
-  id            uuid primary key default gen_random_uuid(),
-  name          varchar not null,
-  slug          varchar not null,                        -- NOT NULL SIN default (real)
-  plan          varchar not null default 'starter',
-  status        varchar not null default 'active',
-  settings_json jsonb   not null default '{}'::jsonb,
-  created_at    timestamptz not null default now(),
-  updated_at    timestamptz not null default now()
+  id          uuid primary key default gen_random_uuid(),
+  name        varchar not null,
+  created_at  timestamptz not null default now()
 );
 
 create table if not exists avl_users (
   id            uuid primary key default gen_random_uuid(),
   tenant_id     uuid not null references tenants(id),
   user_avl_code varchar not null,
-  name          varchar not null,          -- NOT NULL SIN default (real)
   api_key       varchar not null unique,   -- índice avl_users_api_key_key
   is_active     boolean not null default true,
   created_at    timestamptz not null default now()
 );
 
 create table if not exists vehicles (
-  id            uuid primary key default gen_random_uuid(),
-  tenant_id     uuid not null references tenants(id),
-  plate         varchar not null,
-  vehicle_type  varchar not null,          -- NOT NULL SIN default (real)
-  fuel_type     varchar not null,          -- NOT NULL SIN default (real)
-  status        varchar not null,          -- NOT NULL SIN default (real)
-  metadata_json jsonb   not null default '{}'::jsonb,
-  is_blocked    boolean not null default false,
-  block_reason  text,
-  created_at    timestamptz not null default now(),
+  id           uuid primary key default gen_random_uuid(),
+  tenant_id    uuid not null references tenants(id),
+  plate        varchar not null,
+  is_blocked   boolean not null default false,
+  block_reason text,
+  created_at   timestamptz not null default now(),
   unique (tenant_id, plate)
 );
 
@@ -58,8 +48,7 @@ create table if not exists drivers (
   id         uuid primary key default gen_random_uuid(),
   tenant_id  uuid not null references tenants(id),
   document   varchar,                      -- NULLABLE en la base real
-  full_name  varchar not null,             -- NOT NULL (real)
-  status     varchar not null,             -- NOT NULL SIN default (real)
+  full_name  varchar,
   created_at timestamptz not null default now()
 );
 -- índice UNIQUE parcial: (tenant_id, document) where document is not null
@@ -230,6 +219,29 @@ create table if not exists mobile_activations (
   is_active       boolean not null default true,
   created_at      timestamptz not null default now(),
   unique (driver_id, vehicle_id)
+);
+
+-- Configuración operativa por tenant que el login devuelve a la app.
+-- Réplica de la tabla que YA EXISTE en producción (este archivo jamás se
+-- ejecuta contra Supabase). Los CHECK espejan los rangos que la app también
+-- valida por su cuenta.
+create table if not exists tenant_mobile_config (
+  tenant_id                   uuid primary key references tenants(id),
+  heartbeat_interval_minutes  integer not null default 5
+    check (heartbeat_interval_minutes between 1 and 120),
+  stop_threshold_minutes      integer not null default 5
+    check (stop_threshold_minutes between 1 and 120),
+  interval_moving_seconds     integer not null default 5
+    check (interval_moving_seconds between 1 and 300),
+  interval_idle_seconds       integer not null default 30
+    check (interval_idle_seconds between 1 and 600),
+  min_displacement_meters     integer not null default 10
+    check (min_displacement_meters between 0 and 500),
+  max_accuracy_meters         integer not null default 50
+    check (max_accuracy_meters between 5 and 1000),
+  auto_resume_minutes         integer not null default 3
+    check (auto_resume_minutes between 1 and 60),
+  updated_at                  timestamptz not null default now()
 );
 
 create table if not exists trip_attachments (

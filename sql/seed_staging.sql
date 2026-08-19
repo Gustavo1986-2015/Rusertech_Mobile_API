@@ -33,8 +33,6 @@ declare
   v_plate           text := 'AB123CD';
   v_activation_code text := 'PILOTO01';
   v_alert_email     text := 'operaciones@clientepiloto.com';
-  v_vehicle_type    text := 'camioneta';   -- vocabulario libre: sin CHECK en la base
-  v_fuel_type       text := 'diesel';
   -- ------------------------------------------------------------------------
 
   v_tenant_id     uuid;
@@ -46,9 +44,7 @@ begin
   -- 1) Tenant --------------------------------------------------------------
   select id into v_tenant_id from tenants where name = v_tenant_name;
   if v_tenant_id is null then
-    insert into tenants (name, slug)
-    values (v_tenant_name, lower(replace(v_tenant_name, ' ', '-')))
-    returning id into v_tenant_id;
+    insert into tenants (name) values (v_tenant_name) returning id into v_tenant_id;
     raise notice 'tenant creado: %', v_tenant_id;
   else
     raise notice 'tenant ya existía: %', v_tenant_id;
@@ -73,9 +69,8 @@ begin
     from avl_users
    where tenant_id = v_tenant_id and user_avl_code = v_avl_code;
   if v_avl_user_id is null then
-    insert into avl_users (tenant_id, user_avl_code, name, api_key, is_active)
-    values (v_tenant_id, v_avl_code, 'App Mobile Rusertech',
-            encode(gen_random_bytes(24), 'hex'), true)
+    insert into avl_users (tenant_id, user_avl_code, api_key, is_active)
+    values (v_tenant_id, v_avl_code, encode(gen_random_bytes(24), 'hex'), true)
     returning id into v_avl_user_id;
     raise notice 'avl_user creado: %', v_avl_user_id;
   else
@@ -86,8 +81,8 @@ begin
   select id into v_driver_id
     from drivers where tenant_id = v_tenant_id and document = v_driver_document;
   if v_driver_id is null then
-    insert into drivers (tenant_id, document, full_name, status)
-    values (v_tenant_id, v_driver_document, v_driver_name, 'active')
+    insert into drivers (tenant_id, document, full_name)
+    values (v_tenant_id, v_driver_document, v_driver_name)
     returning id into v_driver_id;
     raise notice 'driver creado: %', v_driver_id;
   end if;
@@ -95,10 +90,8 @@ begin
   select id into v_vehicle_id
     from vehicles where tenant_id = v_tenant_id and plate = upper(trim(v_plate));
   if v_vehicle_id is null then
-    insert into vehicles
-      (tenant_id, plate, vehicle_type, fuel_type, status, metadata_json, is_blocked)
-    values (v_tenant_id, upper(trim(v_plate)), v_vehicle_type, v_fuel_type,
-            'active', '{}'::jsonb, false)
+    insert into vehicles (tenant_id, plate, is_blocked)
+    values (v_tenant_id, upper(trim(v_plate)), false)
     returning id into v_vehicle_id;
     raise notice 'vehicle creado: %', v_vehicle_id;
   end if;
@@ -121,6 +114,13 @@ begin
     select 1 from mobile_alert_channels
      where tenant_id = v_tenant_id and channel_type = 'email' and target = v_alert_email
   );
+
+  -- 7) Configuración operativa del tenant ----------------------------------
+  --    Con los valores por defecto (los mismos que la app trae de fábrica):
+  --    el login la devuelve y la app se comporta idéntico que sin config.
+  insert into tenant_mobile_config (tenant_id)
+  values (v_tenant_id)
+  on conflict (tenant_id) do nothing;
 
   raise notice 'seed completo para tenant %', v_tenant_id;
 end;

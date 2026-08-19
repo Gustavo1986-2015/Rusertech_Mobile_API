@@ -100,6 +100,49 @@ AVLCODE=$(jqr '.avlUserCode')
   || { fail "no devolvió apiKey — no se puede seguir"; exit 1; }
 
 # ---------------------------------------------------------------------
+step "1b. Configuración operativa en el login (contrato con la app)"
+
+# Tenant CON fila en tenant_mobile_config → objeto config completo, camelCase.
+CFG_TYPE=$(jqr '.config | type')
+if [ "$CFG_TYPE" = "object" ]; then
+  pass "el login devuelve el objeto config"
+  CFG_KEYS=$(jqr '.config | keys | sort | join(",")')
+  EXPECTED_KEYS="autoResumeMinutes,heartbeatIntervalMinutes,intervalIdleSeconds,intervalMovingSeconds,maxAccuracyMeters,minDisplacementMeters,stopThresholdMinutes"
+  assert_eq "$EXPECTED_KEYS" "$CFG_KEYS" "los 7 campos, en camelCase, ni uno más ni uno menos"
+  NONNUM=$(jqr '[.config[] | select(type != "number")] | length')
+  assert_eq "0" "$NONNUM" "los 7 valores son numéricos"
+else
+  fail "el tenant tiene fila de config pero el login no devolvió config (type=$CFG_TYPE)"
+fi
+
+if have_sql; then
+  # Tenant SIN fila → 200 y la clave config OMITIDA (ni null ni {}).
+  CFG_TENANT=$(sql "select tenant_id from mobile_activations where activation_code = '$ACTIVATION_CODE'")
+  sql "delete from tenant_mobile_config where tenant_id = '$CFG_TENANT'" >/dev/null
+  noauth_req POST /api/v1/mobile/login \
+    "{\"documentId\":\"$DNI\",\"plate\":\"$PLATE\",\"activationCode\":\"$ACTIVATION_CODE\"}"
+  assert_status 200 "$CODE" "sin fila de config el login responde igual"
+  assert_eq "false" "$(jqr 'has("config")')" "la clave config se OMITE (ni null ni objeto vacío)"
+
+  # Fallo de la consulta de config (tabla ausente) → 200 igual, sin config.
+  # Simulación: renombrar la tabla. El login NO puede romperse por esto.
+  sql "alter table tenant_mobile_config rename to tenant_mobile_config__rota" >/dev/null
+  noauth_req POST /api/v1/mobile/login \
+    "{\"documentId\":\"$DNI\",\"plate\":\"$PLATE\",\"activationCode\":\"$ACTIVATION_CODE\"}"
+  assert_status 200 "$CODE" "con la tabla de config ROTA el login sobrevive (error solo en el log)"
+  assert_eq "false" "$(jqr 'has("config")')" "y responde sin la clave config"
+  sql "alter table tenant_mobile_config__rota rename to tenant_mobile_config" >/dev/null
+
+  # Restaurar la fila del seed para el resto de la suite y corridas futuras.
+  sql "insert into tenant_mobile_config (tenant_id) values ('$CFG_TENANT') on conflict (tenant_id) do nothing" >/dev/null
+  noauth_req POST /api/v1/mobile/login \
+    "{\"documentId\":\"$DNI\",\"plate\":\"$PLATE\",\"activationCode\":\"$ACTIVATION_CODE\"}"
+  assert_eq "object" "$(jqr '.config | type')" "restaurada la fila, el config vuelve"
+else
+  skip "sin PSQL: no se simulan tenant-sin-fila ni fallo de la tabla (solo contra local)"
+fi
+
+# ---------------------------------------------------------------------
 step "2. Login con código de activación inválido → 401"
 noauth_req POST /api/v1/mobile/login \
   "{\"documentId\":\"$DNI\",\"plate\":\"$PLATE\",\"activationCode\":\"CODIGOMALO\"}"
@@ -262,18 +305,6 @@ req POST /api/v1/trips "{\"vehicleId\":\"$PLATE\",\"driverId\":\"$DNI\",\"planne
 assert_status 422 "$CODE" "solo se aceptan 2/4/6/10/12"
 
 # ---------------------------------------------------------------------
-# --- Setup del gate local: canal webhook apuntando al mock (idempotente). ---
-# Sin esto, las asertaciones de webhook del paso 12 no son reproducibles desde
-# el repo: el seed solo crea el canal email. Contra Vercel (sin PSQL) no aplica.
-if have_sql && [ -n "${MOCK_LOG:-}" ]; then
-  sql "insert into mobile_alert_channels (tenant_id, channel_type, target, secret, notify_codes, is_active)
-       select a.tenant_id, 'webhook', 'http://127.0.0.1:4010/webhook', 'secreto-de-prueba', '{MOB_SOS}', true
-         from avl_users a where a.api_key = '$APIKEY'
-          and not exists (select 1 from mobile_alert_channels
-                           where channel_type = 'webhook'
-                             and target = 'http://127.0.0.1:4010/webhook')" >/dev/null
-fi
-
 step "10. Evento MOB_SOS con viaje → telemetry + trip_events"
 EV_BEFORE=$(sql "select count(*) from trip_events where trip_id='$TRIP_ID'" || echo 0)
 START=$(date +%s%N)
