@@ -4,10 +4,18 @@
  * o el backend se reemplaza por Rusertech Web, este es el único archivo a tocar.
  */
 
-// --- Vocabulario de trips.status (CHECK real en la base) ---------------
-// draft / scheduled / in_progress / completed / cancelled
-export const TRIP_STATUS_ACTIVE = 'in_progress';
-export const TRIP_STATUS_COMPLETED = 'completed';
+// --- Vocabulario de trips.status (base del SaaS) -----------------------
+// La web usa el vocabulario en ESPAÑOL (verificado en su repo):
+// PROGRAMADO / EN_CURSO / FINALIZADO / CANCELADO. Un viaje cerrado con otro
+// valor queda en un limbo: la web no lo muestra ni activo ni finalizado.
+// Regla: las ESCRITURAS van en español; las LECTURAS toleran también el
+// vocabulario heredado en inglés ('in_progress'), igual que el índice único
+// de viaje activo, que cubre ambos. Si la web cambia de vocabulario, este
+// es el único lugar a tocar. (La API no cancela viajes; si algún día lo
+// hace, el valor es 'CANCELADO'.)
+export const TRIP_STATUS_ACTIVE = 'EN_CURSO';
+export const TRIP_STATUS_ACTIVE_SET = ['EN_CURSO', 'in_progress'];
+export const TRIP_STATUS_COMPLETED = 'FINALIZADO';
 
 // --- Vocabulario que ve la APP (contrato de API, no de base) -----------
 // TripResponse.status ∈ {"active","completed"} — §3.2 del spec.
@@ -16,9 +24,9 @@ export const API_TRIP_STATUS_COMPLETED = 'completed';
 
 /** Traduce el status de la base al vocabulario que espera la app. */
 export function toApiTripStatus(dbStatus: string): string {
-  return dbStatus === TRIP_STATUS_COMPLETED
-    ? API_TRIP_STATUS_COMPLETED
-    : API_TRIP_STATUS_ACTIVE;
+  return (TRIP_STATUS_ACTIVE_SET as readonly string[]).includes(dbStatus)
+    ? API_TRIP_STATUS_ACTIVE
+    : API_TRIP_STATUS_COMPLETED;
 }
 
 // --- Estados operativos del conductor (FIX-10) -------------------------
@@ -46,8 +54,19 @@ export function severityForCode(code: string): string {
 // --- Límites -----------------------------------------------------------
 export const BATCH_MAX_ITEMS = 50;
 export const ATTACHMENT_MAX_BYTES = 2 * 1024 * 1024; // 2 MB
-export const LOGIN_MAX_ATTEMPTS = 5;
-export const LOGIN_WINDOW_MS = 10 * 60 * 1000; // 10 min
+
+// Rate limit de login, contra mobile_login_attempts (global entre instancias).
+export const LOGIN_WINDOW_MINUTES = 15;
+export const LOGIN_MAX_FAILURES_IDENTITY = 5; // por documento + patente
+export const LOGIN_MAX_FAILURES_IP = 20;
+
+// avl_user compartido de ingesta mobile: el login devuelve SUS credenciales
+// y todo payload viaja con User_avl = este código.
+export const MOBILE_AVL_USER_CODE = 'Rusertech_Mobile';
+
+// Duración asumida de un viaje cuando el conductor no declara ninguna.
+// Queda registrada en trips.metadata_json para distinguirla de una declarada.
+export const PLANNED_HOURS_FALLBACK = 8;
 
 /** Prefijo obligatorio de todo código de evento móvil (§0.2). */
 export const MOBILE_CODE_PREFIX = 'MOB_';

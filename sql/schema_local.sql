@@ -1,6 +1,9 @@
 -- =====================================================================
 -- Rusertech Mobile — RÉPLICA LOCAL del esquema real de Supabase
--- Fuente de verdad: DB SNAPSHOT 12/08/2026 (verificado por Gustavo).
+-- Fuente de verdad: base del SaaS `rudaqsfgjorryuqayqyd` (migrada y
+-- verificada el 21/08/2026). Réplica INFERIDA de lo que la API toca: si
+-- algo difiere del esquema real, manda el VERIFY contra staging y este
+-- archivo se corrige — nunca al revés.
 --
 -- Este archivo NO se ejecuta nunca contra Supabase. Existe solo para
 -- levantar un Postgres 16 local idéntico y correr el gate VERIFY de §4.6
@@ -22,6 +25,7 @@ create extension if not exists "uuid-ossp";
 create table if not exists tenants (
   id          uuid primary key default gen_random_uuid(),
   name        varchar not null,
+  slug        varchar unique,
   created_at  timestamptz not null default now()
 );
 
@@ -40,6 +44,9 @@ create table if not exists vehicles (
   plate        varchar not null,
   is_blocked   boolean not null default false,
   block_reason text,
+  -- avl_user asociado al vehículo: su is_active es el switch de revocación
+  -- por vehículo que el login traduce a 403.
+  avl_user_id  uuid references avl_users(id),
   created_at   timestamptz not null default now(),
   unique (tenant_id, plate)
 );
@@ -142,13 +149,20 @@ create table if not exists trips (
   planned_end            timestamptz not null,
   actual_start           timestamptz,
   actual_end             timestamptz,
+  -- La web usa el vocabulario en español (PROGRAMADO/EN_CURSO/FINALIZADO/
+  -- CANCELADO); se admite también el heredado en inglés para las lecturas
+  -- tolerantes de la API.
   status                 varchar not null default 'draft'
-                         check (status in ('draft','scheduled','in_progress','completed','cancelled')),
+                         check (status in ('PROGRAMADO','EN_CURSO','FINALIZADO','CANCELADO',
+                                           'draft','scheduled','in_progress','completed','cancelled')),
   driver_state           varchar
                          check (driver_state in ('en_route','stopped_waypoint','stopped_authorized','stopped_sanitary')),
   corridor_meters        integer not null default 500,
   criticality            varchar not null default 'normal',
   reinforced_monitoring  boolean not null default false,
+  -- Registro de decisiones de la API (p. ej. duración asumida sin declarar).
+  metadata_json          jsonb,
+  trip_type              varchar,
   created_at             timestamptz not null default now()
 );
 
@@ -160,7 +174,7 @@ create index if not exists trips_driver
 -- Un solo viaje en curso por vehículo. Un segundo INSERT falla con 23505
 -- y la API responde 409 devolviendo el viaje existente.
 create unique index if not exists trips_one_in_progress_per_vehicle
-  on trips (vehicle_id) where status = 'in_progress';
+  on trips (vehicle_id) where status in ('EN_CURSO','in_progress');
 
 -- ---------------------------------------------------------------------
 -- trip_events
@@ -209,17 +223,37 @@ create trigger trg_trip_events_fill_location
 -- Tablas mobile (ya existen en la base real — acá se replican)
 -- ---------------------------------------------------------------------
 
-create table if not exists mobile_activations (
+create table if not exists mobile_activation_codes (
   id              uuid primary key default gen_random_uuid(),
   tenant_id       uuid not null references tenants(id),
   driver_id       uuid not null references drivers(id),
   vehicle_id      uuid not null references vehicles(id),
-  avl_user_id     uuid not null references avl_users(id),
   activation_code varchar not null unique,   -- único GLOBAL: el login no conoce el tenant
-  is_active       boolean not null default true,
-  created_at      timestamptz not null default now(),
-  unique (driver_id, vehicle_id)
+  -- Vigencia: sin is_active — un código vale mientras no esté revocado ni
+  -- vencido. used_at registra el primer login exitoso (trazabilidad, no
+  -- bloquea reusos).
+  revoked_at      timestamptz,
+  expires_at      timestamptz not null,
+  used_at         timestamptz,
+  created_at      timestamptz not null default now()
 );
+
+-- Registro de intentos de login (rate limit GLOBAL entre instancias).
+create table if not exists mobile_login_attempts (
+  id             uuid primary key default gen_random_uuid(),
+  document_id    varchar(20),
+  plate          varchar(10),
+  ip_address     varchar(45) not null,
+  success        boolean not null,
+  failure_reason varchar(50),
+  user_agent     text,
+  created_at     timestamptz not null default now()
+);
+
+create index if not exists mobile_login_attempts_identity
+  on mobile_login_attempts (document_id, plate, created_at);
+create index if not exists mobile_login_attempts_ip
+  on mobile_login_attempts (ip_address, created_at);
 
 -- Configuración operativa por tenant que el login devuelve a la app.
 -- Réplica de la tabla que YA EXISTE en producción (este archivo jamás se

@@ -1,4 +1,5 @@
 import { authenticate } from '@/lib/auth';
+import { MOBILE_AVL_USER_CODE } from '@/lib/config';
 import { query } from '@/lib/db';
 import { guarded, json } from '@/lib/http';
 import { SYSTEM_USER_EMAIL } from '@/lib/trips';
@@ -29,7 +30,7 @@ const REQUIRED: Record<string, string[]> = {
     'origin_address', 'origin_lat', 'origin_lng',
     'destination_address', 'destination_lat', 'destination_lng',
     'notes', 'planned_start', 'planned_end', 'actual_start', 'actual_end',
-    'status', 'driver_state',
+    'status', 'driver_state', 'metadata_json',
   ],
   trip_events: [
     'tenant_id', 'trip_id', 'event_type', 'severity', 'latitude', 'longitude',
@@ -39,10 +40,18 @@ const REQUIRED: Record<string, string[]> = {
     'tenant_id', 'trip_id', 'vehicle_id', 'driver_document', 'type', 'notes',
     'latitude', 'longitude', 'storage_path',
   ],
-  mobile_activations: ['tenant_id', 'driver_id', 'vehicle_id', 'avl_user_id', 'activation_code', 'is_active'],
+  // Base del SaaS: mobile_activation_codes (vigencia por revoked_at /
+  // expires_at) reemplaza a la vieja mobile_activations.
+  mobile_activation_codes: [
+    'tenant_id', 'driver_id', 'vehicle_id', 'activation_code',
+    'revoked_at', 'expires_at', 'used_at',
+  ],
+  mobile_login_attempts: [
+    'document_id', 'plate', 'ip_address', 'success', 'failure_reason', 'user_agent',
+  ],
   mobile_alert_channels: ['tenant_id', 'channel_type', 'target', 'secret', 'notify_codes', 'is_active'],
   avl_users: ['tenant_id', 'user_avl_code', 'api_key', 'is_active'],
-  vehicles: ['tenant_id', 'plate', 'is_blocked', 'block_reason'],
+  vehicles: ['tenant_id', 'plate', 'is_blocked', 'block_reason', 'avl_user_id'],
   drivers: ['tenant_id', 'document'],
   users: ['tenant_id', 'email', 'role_code', 'status'],
 };
@@ -89,6 +98,17 @@ export const GET = guarded(async (req: Request) => {
   );
   if (!sysUser[0]) {
     problems.push(`falta el usuario de sistema ${SYSTEM_USER_EMAIL} (correr seed_staging.sql)`);
+  }
+
+  // --- avl_user compartido de ingesta mobile ------------------------------
+  const { rows: mobileAvl } = await query<{ is_active: boolean }>(
+    `select is_active from avl_users where tenant_id = $1 and user_avl_code = $2 limit 1`,
+    [auth.ctx.tenantId, MOBILE_AVL_USER_CODE],
+  );
+  if (!mobileAvl[0]) {
+    problems.push(`falta el avl_user '${MOBILE_AVL_USER_CODE}' del tenant (el login no puede emitir credenciales)`);
+  } else if (!mobileAvl[0].is_active) {
+    problems.push(`el avl_user '${MOBILE_AVL_USER_CODE}' está desactivado (todos los logins darán 403)`);
   }
 
   // --- env vars -----------------------------------------------------------

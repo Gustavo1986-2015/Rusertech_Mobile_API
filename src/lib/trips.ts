@@ -1,7 +1,13 @@
 import { isUniqueViolation, query, withTransaction } from './db';
 import type { AuthContext } from './auth';
 import type { CreateTripInput } from './payload';
-import { TRIP_STATUS_ACTIVE, TRIP_STATUS_COMPLETED, toApiTripStatus } from './config';
+import {
+  PLANNED_HOURS_FALLBACK,
+  TRIP_STATUS_ACTIVE,
+  TRIP_STATUS_ACTIVE_SET,
+  TRIP_STATUS_COMPLETED,
+  toApiTripStatus,
+} from './config';
 
 /** Lo que ve la app. Se mantiene MÍNIMO a propósito: el modelo Kotlin es la
  *  referencia y campos de más pueden romper la deserialización si el Json
@@ -77,6 +83,20 @@ export async function createTrip(
     ? `Carga: ${input.cargoType}.${input.notes ? ` ${input.notes}` : ''}`
     : input.notes;
 
+  // planned_start / planned_end son NOT NULL y la app no los manda: los
+  // calcula la API. planned_start = ahora; planned_end = ahora + duración
+  // declarada por el conductor — y si no declaró ninguna, se asume el
+  // fallback y queda REGISTRADO en metadata_json (una duración asumida no
+  // puede confundirse con una declarada).
+  const plannedHours = input.plannedHours ?? PLANNED_HOURS_FALLBACK;
+  const metadata =
+    input.plannedHours == null
+      ? JSON.stringify({
+          duracion_asumida_horas: PLANNED_HOURS_FALLBACK,
+          motivo: 'el conductor no declaró duración estimada',
+        })
+      : null;
+
   // corridor_meters / criticality / reinforced_monitoring NO se envían:
   // la base ya tiene defaults (500 / 'normal' / false). No inventar valores.
   try {
@@ -85,12 +105,14 @@ export async function createTrip(
          tenant_id, vehicle_id, driver_id, created_by_user_id, name,
          origin_address, origin_lat, origin_lng,
          destination_address, destination_lat, destination_lng,
-         notes, planned_start, planned_end, actual_start, status, driver_state)
+         notes, planned_start, planned_end, actual_start, status, driver_state,
+         metadata_json)
        values (
          $1, $2, $3, $4, $5,
          $6, $7, $8,
          $9, $10, $11,
-         $12, now(), now() + ($13 || ' hours')::interval, now(), $14, 'en_route')
+         $12, now(), now() + ($13 || ' hours')::interval, now(), $14, 'en_route',
+         $15::jsonb)
        returning id, status`,
       [
         ctx.tenantId,
@@ -105,8 +127,9 @@ export async function createTrip(
         input.destinationLat,
         input.destinationLng,
         notes,
-        String(input.plannedHours),
+        String(plannedHours),
         TRIP_STATUS_ACTIVE,
+        metadata,
       ],
     );
     return {
@@ -130,11 +153,13 @@ export async function findActiveTripByVehicle(
   tenantId: string,
   vehicleId: string,
 ): Promise<TripResponse | null> {
+  // Lectura tolerante: la base del SaaS mezcla 'EN_CURSO' (demo de la web) e
+  // 'in_progress' (heredado) — el índice único de viaje activo cubre ambos.
   const { rows } = await query<{ id: string; status: string }>(
     `select id, status from trips
-      where tenant_id = $1 and vehicle_id = $2 and status = $3
+      where tenant_id = $1 and vehicle_id = $2 and status = any($3::text[])
       limit 1`,
-    [tenantId, vehicleId, TRIP_STATUS_ACTIVE],
+    [tenantId, vehicleId, TRIP_STATUS_ACTIVE_SET],
   );
   if (!rows[0]) return null;
   return { tripId: rows[0].id, status: toApiTripStatus(rows[0].status) };
@@ -148,9 +173,9 @@ export async function findActiveTripByPlate(
     `select t.id, t.status
        from trips t
        join vehicles v on v.id = t.vehicle_id
-      where t.tenant_id = $1 and v.plate = $2 and t.status = $3
+      where t.tenant_id = $1 and v.plate = $2 and t.status = any($3::text[])
       limit 1`,
-    [ctx.tenantId, plate, TRIP_STATUS_ACTIVE],
+    [ctx.tenantId, plate, TRIP_STATUS_ACTIVE_SET],
   );
   if (!rows[0]) return null;
   return { tripId: rows[0].id, status: toApiTripStatus(rows[0].status) };
@@ -173,9 +198,9 @@ export async function completeTrip(
     const { rows: updated } = await client.query<{ id: string; status: string }>(
       `update trips
           set status = $1, actual_end = now(), driver_state = null
-        where id = $2 and tenant_id = $3 and status = $4
+        where id = $2 and tenant_id = $3 and status = any($4::text[])
         returning id, status`,
-      [TRIP_STATUS_COMPLETED, tripId, ctx.tenantId, TRIP_STATUS_ACTIVE],
+      [TRIP_STATUS_COMPLETED, tripId, ctx.tenantId, TRIP_STATUS_ACTIVE_SET],
     );
 
     if (updated[0]) {

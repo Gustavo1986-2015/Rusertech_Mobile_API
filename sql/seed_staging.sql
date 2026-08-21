@@ -1,21 +1,25 @@
 -- =====================================================================
 -- Rusertech Mobile — SEED de staging (IDEMPOTENTE)
 --
--- Se puede correr N veces sin duplicar nada: todo INSERT va con
--- "where not exists" o "on conflict do nothing".
+-- Para la base del SaaS (`rudaqsfgjorryuqayqyd`) o su réplica local.
+-- La base del SaaS YA tiene el tenant `demo` sembrado (21/08/2026): contra
+-- ella este seed es un no-op que solo completa lo que falte. Su valor está
+-- en la réplica local del gate VERIFY y en entornos futuros.
 --
--- NO ejecuta DDL. NO altera tablas existentes. Solo INSERTA filas.
+-- Se puede correr N veces sin duplicar nada. NO ejecuta DDL.
 --
 -- Qué crea (si falta):
---   1. tenant piloto
+--   1. tenant demo (slug 'demo')
 --   2. usuario de sistema mobile@system.rusertech (role_code 'driver')
 --      con password_hash 'SYSTEM-NO-LOGIN' → no es un hash bcrypt válido,
 --      así que ninguna verificación de password puede pasar. Firma los
 --      trips creados desde la app, no es una puerta de entrada.
---   3. avl_user mobile del tenant, con su api_key
---   4. driver + vehicle de prueba
---   5. mobile_activations con el código de activación
+--   3. avl_user compartido de ingesta 'Rusertech_Mobile' con su api_key
+--   4. driver + vehicle de prueba (el vehicle apunta su avl_user_id al
+--      avl_user mobile: es el switch de revocación por vehículo)
+--   5. mobile_activation_codes con el código vigente 1 año
 --   6. canal de aviso de eventos críticos
+--   7. configuración operativa del tenant
 --
 -- El bucket privado `cargo-photos` NO va acá: se crea a mano en
 -- Supabase → Storage → New bucket → privado.
@@ -26,12 +30,13 @@
 do $$
 declare
   -- ---------------- CONFIGURACIÓN — editar antes de correr ----------------
-  v_tenant_name     text := 'Rusertech Piloto';
-  v_avl_code        text := 'mobile_app_01';
+  v_tenant_name     text := 'Demo';
+  v_tenant_slug     text := 'demo';
+  v_avl_code        text := 'Rusertech_Mobile';
   v_driver_document text := '12345678';
   v_driver_name     text := 'Conductor Piloto';
   v_plate           text := 'AB123CD';
-  v_activation_code text := 'PILOTO01';
+  v_activation_code text := 'RUTA2648';
   v_alert_email     text := 'operaciones@clientepiloto.com';
   -- ------------------------------------------------------------------------
 
@@ -41,10 +46,11 @@ declare
   v_driver_id     uuid;
   v_vehicle_id    uuid;
 begin
-  -- 1) Tenant --------------------------------------------------------------
-  select id into v_tenant_id from tenants where name = v_tenant_name;
+  -- 1) Tenant (por slug: es el identificador estable del SaaS) --------------
+  select id into v_tenant_id from tenants where slug = v_tenant_slug;
   if v_tenant_id is null then
-    insert into tenants (name) values (v_tenant_name) returning id into v_tenant_id;
+    insert into tenants (name, slug) values (v_tenant_name, v_tenant_slug)
+    returning id into v_tenant_id;
     raise notice 'tenant creado: %', v_tenant_id;
   else
     raise notice 'tenant ya existía: %', v_tenant_id;
@@ -64,7 +70,9 @@ begin
     raise notice 'usuario de sistema ya existía: %', v_user_id;
   end if;
 
-  -- 3) avl_user mobile -----------------------------------------------------
+  -- 3) avl_user compartido de ingesta mobile -------------------------------
+  --    El login devuelve SUS credenciales y todo payload viaja con
+  --    User_avl = este código.
   select id into v_avl_user_id
     from avl_users
    where tenant_id = v_tenant_id and user_avl_code = v_avl_code;
@@ -90,20 +98,25 @@ begin
   select id into v_vehicle_id
     from vehicles where tenant_id = v_tenant_id and plate = upper(trim(v_plate));
   if v_vehicle_id is null then
-    insert into vehicles (tenant_id, plate, is_blocked)
-    values (v_tenant_id, upper(trim(v_plate)), false)
+    -- avl_user_id: switch de revocación por vehículo (403 del login).
+    insert into vehicles (tenant_id, plate, is_blocked, avl_user_id)
+    values (v_tenant_id, upper(trim(v_plate)), false, v_avl_user_id)
     returning id into v_vehicle_id;
     raise notice 'vehicle creado: %', v_vehicle_id;
+  else
+    -- Completar el switch si el vehicle existía sin avl_user asignado.
+    update vehicles set avl_user_id = v_avl_user_id
+     where id = v_vehicle_id and avl_user_id is null;
   end if;
 
-  -- 5) Activación mobile ---------------------------------------------------
-  --    Doble guarda: activation_code es UNIQUE global y (driver_id, vehicle_id)
-  --    también es UNIQUE. on conflict do nothing cubre ambas.
-  insert into mobile_activations
-    (tenant_id, driver_id, vehicle_id, avl_user_id, activation_code, is_active)
-  select v_tenant_id, v_driver_id, v_vehicle_id, v_avl_user_id, v_activation_code, true
+  -- 5) Código de activación ------------------------------------------------
+  --    Vigencia por revoked_at/expires_at (sin is_active). used_at queda
+  --    null: lo setea el primer login exitoso.
+  insert into mobile_activation_codes
+    (tenant_id, driver_id, vehicle_id, activation_code, expires_at)
+  select v_tenant_id, v_driver_id, v_vehicle_id, v_activation_code, now() + interval '1 year'
   where not exists (
-    select 1 from mobile_activations where activation_code = v_activation_code
+    select 1 from mobile_activation_codes where activation_code = v_activation_code
   )
   on conflict do nothing;
 
@@ -130,18 +143,20 @@ $$;
 -- Credenciales para el VERIFY con curl. Copiar estos valores.
 -- =====================================================================
 select
-  t.name                as tenant,
-  ma.activation_code    as activation_code,
+  t.slug                as tenant,
+  mac.activation_code   as activation_code,
+  mac.expires_at        as vence,
+  mac.used_at           as primer_uso,
   d.document            as dni,
   v.plate               as patente,
   au.user_avl_code      as avl_user_code,
   au.api_key            as api_key,
   au.is_active          as avl_activo,
   u.email               as usuario_sistema
-from mobile_activations ma
-join tenants   t  on t.id  = ma.tenant_id
-join drivers   d  on d.id  = ma.driver_id
-join vehicles  v  on v.id  = ma.vehicle_id
-join avl_users au on au.id = ma.avl_user_id
-left join users u on u.tenant_id = ma.tenant_id and u.email = 'mobile@system.rusertech'
-order by ma.created_at desc;
+from mobile_activation_codes mac
+join tenants   t  on t.id  = mac.tenant_id
+join drivers   d  on d.id  = mac.driver_id
+join vehicles  v  on v.id  = mac.vehicle_id
+left join avl_users au on au.tenant_id = mac.tenant_id and au.user_avl_code = 'Rusertech_Mobile'
+left join users u on u.tenant_id = mac.tenant_id and u.email = 'mobile@system.rusertech'
+order by mac.created_at desc;

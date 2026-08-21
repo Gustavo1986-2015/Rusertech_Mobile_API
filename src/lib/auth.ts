@@ -1,6 +1,10 @@
 import { query } from './db';
 import { forbidden, unauthorized } from './http';
-import { LOGIN_MAX_ATTEMPTS, LOGIN_WINDOW_MS } from './config';
+import {
+  LOGIN_MAX_FAILURES_IDENTITY,
+  LOGIN_MAX_FAILURES_IP,
+  LOGIN_WINDOW_MINUTES,
+} from './config';
 
 export const API_KEY_HEADER = 'x-hub-api-key';
 
@@ -63,38 +67,99 @@ export async function authenticate(
   };
 }
 
+// ---------------------------------------------------------------------
+// Rate limit de login — contra mobile_login_attempts.
+//
+// Reemplaza el conteo en memoria del proceso (que era por instancia de
+// Vercel, no global). La tabla registra CADA intento, exitoso o fallido, y
+// el bloqueo cuenta solo los fallidos de la ventana: 5 por documento+patente
+// o 20 por IP en 15 minutos.
+// ---------------------------------------------------------------------
+
+/** IP y user agent del request. En Vercel la IP viene en x-forwarded-for
+ *  (primer salto); si falta, centinela 'unknown' — la columna es NOT NULL y
+ *  un header ausente jamás puede tumbar un login. */
+export function extractClientContext(req: Request): { ipAddress: string; userAgent: string | null } {
+  const forwarded = req.headers.get('x-forwarded-for');
+  const ipAddress = forwarded?.split(',')[0]?.trim() || 'unknown';
+  return { ipAddress: ipAddress.slice(0, 45), userAgent: req.headers.get('user-agent') };
+}
+
 /**
- * Rate limit de login: máx. 5 intentos FALLIDOS por DNI cada 10 min (§4.5).
+ * @returns segundos de Retry-After si está bloqueado, o null si puede seguir.
  *
- * Se cuenta en memoria del proceso. Limitación conocida y aceptada para el
- * piloto: Vercel puede tener varias instancias de función vivas, así que el
- * límite es por instancia, no global. La base está congelada (no se pueden
- * crear tablas) y no se quiso sumar otro servicio (KV/Redis) por una función
- * anti-fuerza-bruta de un piloto. Si el volumen lo justifica, el reemplazo
- * natural es Vercel KV sin tocar nada más de este archivo.
+ * FAIL-OPEN deliberado: si la consulta falla (base inaccesible), se loguea y
+ * el login continúa. Dejar a todos los conductores afuera por una falla del
+ * anti-fuerza-bruta sería peor que el riesgo que mitiga.
  */
-const attempts = new Map<string, number[]>();
+export async function isLoginRateLimited(
+  documentId: string,
+  plate: string,
+  ipAddress: string,
+): Promise<number | null> {
+  try {
+    const { rows } = await query<{
+      ident_failures: string;
+      ip_failures: string;
+      ident_oldest: string | null;
+      ip_oldest: string | null;
+    }>(
+      `select
+         count(*) filter (where document_id = $1 and plate = $2)          as ident_failures,
+         count(*) filter (where ip_address = $3)                          as ip_failures,
+         min(created_at) filter (where document_id = $1 and plate = $2)   as ident_oldest,
+         min(created_at) filter (where ip_address = $3)                   as ip_oldest
+       from mobile_login_attempts
+      where success = false
+        and created_at > now() - ($4 || ' minutes')::interval
+        and ((document_id = $1 and plate = $2) or ip_address = $3)`,
+      [documentId, plate, ipAddress, String(LOGIN_WINDOW_MINUTES)],
+    );
+    const r = rows[0];
+    const identBlocked = Number(r.ident_failures) >= LOGIN_MAX_FAILURES_IDENTITY;
+    const ipBlocked = Number(r.ip_failures) >= LOGIN_MAX_FAILURES_IP;
+    if (!identBlocked && !ipBlocked) return null;
 
-function prune(list: number[], now: number): number[] {
-  return list.filter((t) => now - t < LOGIN_WINDOW_MS);
+    // El bloqueo se levanta cuando el fallo más viejo sale de la ventana.
+    const oldest = identBlocked ? r.ident_oldest : r.ip_oldest;
+    if (!oldest) return LOGIN_WINDOW_MINUTES * 60;
+    const liftMs = new Date(oldest).getTime() + LOGIN_WINDOW_MINUTES * 60_000 - Date.now();
+    return Math.max(1, Math.ceil(liftMs / 1000));
+  } catch (err) {
+    console.error('[auth] rate limit no disponible (el login sigue):', (err as Error).message);
+    return null;
+  }
 }
 
-export function isLoginRateLimited(documentId: string): number | null {
-  const now = Date.now();
-  const list = prune(attempts.get(documentId) ?? [], now);
-  attempts.set(documentId, list);
-  if (list.length < LOGIN_MAX_ATTEMPTS) return null;
-  const oldest = list[0];
-  return Math.max(1, Math.ceil((LOGIN_WINDOW_MS - (now - oldest)) / 1000));
-}
-
-export function recordFailedLogin(documentId: string): void {
-  const now = Date.now();
-  const list = prune(attempts.get(documentId) ?? [], now);
-  list.push(now);
-  attempts.set(documentId, list);
-}
-
-export function clearLoginAttempts(documentId: string): void {
-  attempts.delete(documentId);
+/**
+ * Registra un intento de login. NUNCA puede tumbar el login: cualquier fallo
+ * del INSERT se loguea y se sigue — misma regla que la config operativa.
+ * Los valores se truncan al ancho real de cada columna para que un input
+ * largo no convierta el registro en un error.
+ */
+export async function recordLoginAttempt(attempt: {
+  documentId: string;
+  plate: string;
+  ipAddress: string;
+  userAgent: string | null;
+  success: boolean;
+  failureReason?: string;
+}): Promise<void> {
+  try {
+    await query(
+      `insert into mobile_login_attempts
+         (document_id, plate, ip_address, user_agent, success, failure_reason)
+       values ($1, $2, $3, $4, $5, $6)`,
+      [
+        attempt.documentId.slice(0, 20),
+        attempt.plate.slice(0, 10),
+        (attempt.ipAddress || 'unknown').slice(0, 45),
+        attempt.userAgent,
+        attempt.success,
+        attempt.failureReason?.slice(0, 50) ?? null,
+      ],
+    );
+  } catch (err) {
+    console.error('[auth] no se pudo registrar el intento de login (se sigue):', (err as Error).message);
+  }
 }

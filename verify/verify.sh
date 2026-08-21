@@ -13,7 +13,7 @@
 #   BASE_URL          raíz del deployment            (obligatoria)
 #   DNI               documento del conductor        (default 12345678)
 #   PLATE             patente                        (default AB123CD)
-#   ACTIVATION_CODE   código de activación           (default PILOTO01)
+#   ACTIVATION_CODE   código de activación           (default RUTA2648)
 #   PSQL              comando psql para las asertaciones de base.
 #                     Si no se define, se saltean los chequeos de SQL
 #                     (útil corriendo contra Vercel sin acceso a la base).
@@ -23,7 +23,7 @@ set -uo pipefail
 BASE_URL="${BASE_URL:?definí BASE_URL}"
 DNI="${DNI:-12345678}"
 PLATE="${PLATE:-AB123CD}"
-ACTIVATION_CODE="${ACTIVATION_CODE:-PILOTO01}"
+ACTIVATION_CODE="${ACTIVATION_CODE:-RUTA2648}"
 PSQL="${PSQL:-}"
 
 PASS=0; FAIL=0
@@ -88,6 +88,15 @@ printf '%s== VERIFY Rusertech Mobile API ==%s\n' "$BOLD" "$OFF"
 echo "BASE_URL: $BASE_URL"
 have_sql && echo "SQL: habilitado" || echo "SQL: deshabilitado (solo HTTP)"
 
+# Solo gate LOCAL: sin esto, los fallos de corridas anteriores acumulan hacia
+# el bloqueo por IP (20 en 15 min) y el used_at ya estaría seteado. Contra
+# staging no corre (sin PSQL) — ver LEEME: corridas repetidas en 15 min
+# pueden dar 429 por IP, es el rate limit funcionando.
+if have_sql; then
+  sql "delete from mobile_login_attempts" >/dev/null
+  sql "update mobile_activation_codes set used_at = null where activation_code = '$ACTIVATION_CODE'" >/dev/null
+fi
+
 # ---------------------------------------------------------------------
 step "1. Login correcto"
 noauth_req POST /api/v1/mobile/login \
@@ -98,6 +107,23 @@ AVLCODE=$(jqr '.avlUserCode')
 [ -n "$APIKEY" ] && [ "$APIKEY" != "null" ] \
   && pass "devuelve apiKey real (avlUserCode=$AVLCODE)" \
   || { fail "no devolvió apiKey — no se puede seguir"; exit 1; }
+assert_eq "Rusertech_Mobile" "$AVLCODE" "las credenciales son del avl_user compartido de ingesta"
+
+if have_sql; then
+  assert_eq "t" "$(sql "select (used_at is not null) from mobile_activation_codes where activation_code = '$ACTIVATION_CODE'")" \
+    "used_at se seteó en el primer login exitoso"
+  USED_AT_1=$(sql "select used_at from mobile_activation_codes where activation_code = '$ACTIVATION_CODE'")
+  noauth_req POST /api/v1/mobile/login \
+    "{\"documentId\":\"$DNI\",\"plate\":\"$PLATE\",\"activationCode\":\"$ACTIVATION_CODE\"}"
+  assert_status 200 "$CODE" "el código sigue siendo reutilizable (used_at no bloquea)"
+  assert_eq "$USED_AT_1" "$(sql "select used_at from mobile_activation_codes where activation_code = '$ACTIVATION_CODE'")" \
+    "used_at NO se pisa en logins posteriores (queda el primero)"
+  OKROWS=$(sql "select count(*) from mobile_login_attempts where document_id='$DNI' and plate='$PLATE' and success = true")
+  [ "$OKROWS" -ge 2 ] && pass "cada login exitoso queda registrado en mobile_login_attempts ($OKROWS filas)" \
+    || fail "faltan registros de intentos exitosos (hay $OKROWS)"
+  assert_eq "t" "$(sql "select bool_and(ip_address is not null and ip_address <> '') from mobile_login_attempts")" \
+    "ip_address presente en todos los registros (o el centinela 'unknown')"
+fi
 
 # ---------------------------------------------------------------------
 step "1b. Configuración operativa en el login (contrato con la app)"
@@ -117,7 +143,7 @@ fi
 
 if have_sql; then
   # Tenant SIN fila → 200 y la clave config OMITIDA (ni null ni {}).
-  CFG_TENANT=$(sql "select tenant_id from mobile_activations where activation_code = '$ACTIVATION_CODE'")
+  CFG_TENANT=$(sql "select tenant_id from mobile_activation_codes where activation_code = '$ACTIVATION_CODE'")
   sql "delete from tenant_mobile_config where tenant_id = '$CFG_TENANT'" >/dev/null
   noauth_req POST /api/v1/mobile/login \
     "{\"documentId\":\"$DNI\",\"plate\":\"$PLATE\",\"activationCode\":\"$ACTIVATION_CODE\"}"
@@ -147,11 +173,35 @@ step "2. Login con código de activación inválido → 401"
 noauth_req POST /api/v1/mobile/login \
   "{\"documentId\":\"$DNI\",\"plate\":\"$PLATE\",\"activationCode\":\"CODIGOMALO\"}"
 assert_status 401 "$CODE" "código inexistente"
+if have_sql; then
+  assert_eq "1" "$(sql "select count(*) from mobile_login_attempts where success=false and failure_reason='invalid_code'")" \
+    "el fallo quedó registrado con failure_reason='invalid_code'"
+fi
 
 step "2b. Login con código válido pero patente que no corresponde → 404"
 noauth_req POST /api/v1/mobile/login \
   "{\"documentId\":\"$DNI\",\"plate\":\"ZZ999ZZ\",\"activationCode\":\"$ACTIVATION_CODE\"}"
 assert_status 404 "$CODE" "patente no coincide con la activación"
+if have_sql; then
+  assert_eq "1" "$(sql "select count(*) from mobile_login_attempts where success=false and failure_reason='identity_mismatch'")" \
+    "el fallo quedó registrado con failure_reason='identity_mismatch'"
+fi
+
+step "2c. avl_user desactivado → 403 (revocación deliberada)"
+if have_sql; then
+  sql "update avl_users set is_active = false where user_avl_code = 'Rusertech_Mobile'" >/dev/null
+  noauth_req POST /api/v1/mobile/login \
+    "{\"documentId\":\"$DNI\",\"plate\":\"$PLATE\",\"activationCode\":\"$ACTIVATION_CODE\"}"
+  assert_status 403 "$CODE" "avl_user de baja → 403 (la app detiene el tracking, nunca 401)"
+  assert_eq "t" "$(sql "select count(*) >= 1 from mobile_login_attempts where success=false and failure_reason='avl_disabled'")" \
+    "el fallo quedó registrado con failure_reason='avl_disabled'"
+  sql "update avl_users set is_active = true where user_avl_code = 'Rusertech_Mobile'" >/dev/null
+  noauth_req POST /api/v1/mobile/login \
+    "{\"documentId\":\"$DNI\",\"plate\":\"$PLATE\",\"activationCode\":\"$ACTIVATION_CODE\"}"
+  assert_status 200 "$CODE" "reactivado → el login vuelve a funcionar"
+else
+  skip "sin PSQL: no se simula la revocación del avl_user (solo contra local)"
+fi
 
 # ---------------------------------------------------------------------
 step "3. Health check del deployment"
@@ -268,8 +318,8 @@ assert_eq "active" "$(jqr '.status')" "status del contrato es 'active'"
   && pass "tripId emitido por el servidor: $TRIP_ID" || fail "sin tripId"
 
 if have_sql; then
-  assert_eq "in_progress" "$(sql "select status from trips where id='$TRIP_ID'")" \
-    "en base el status es 'in_progress'"
+  assert_eq "EN_CURSO" "$(sql "select status from trips where id='$TRIP_ID'")" \
+    "en base el status es 'EN_CURSO' (el que la web muestra como activo)"
   assert_eq "en_route" "$(sql "select driver_state from trips where id='$TRIP_ID'")" \
     "driver_state arranca en 'en_route' (FIX-10)"
   assert_eq "6" "$(sql "select round(extract(epoch from (planned_end - planned_start))/3600) from trips where id='$TRIP_ID'")" \
@@ -389,7 +439,8 @@ req POST "/api/v1/trips/$TRIP_ID/complete"
 assert_status 200 "$CODE" "primer cierre"
 assert_eq "completed" "$(jqr '.status')" "status 'completed'"
 if have_sql; then
-  assert_eq "completed" "$(sql "select status from trips where id='$TRIP_ID'")" "status en base"
+  assert_eq "FINALIZADO" "$(sql "select status from trips where id='$TRIP_ID'")" \
+    "status en base es 'FINALIZADO' (el que la web muestra como cerrado)"
   assert_eq "" "$(sql "select coalesce(driver_state,'') from trips where id='$TRIP_ID'")" \
     "driver_state se limpió al completar (FIX-10)"
   assert_eq "t" "$(sql "select (actual_end is not null) from trips where id='$TRIP_ID'")" "actual_end seteado"
@@ -400,6 +451,22 @@ assert_status 409 "$CODE" "segundo cierre → 409 (la app lo trata como éxito)"
 
 req POST "/api/v1/trips/$GHOST/complete"
 assert_status 404 "$CODE" "cierre de viaje inexistente → 404"
+
+# ---------------------------------------------------------------------
+step "13b. Viaje SIN duración declarada → 8 h asumidas y registradas"
+req POST /api/v1/trips "{\"vehicleId\":\"$PLATE\",\"driverId\":\"$DNI\"}"
+assert_status 200 "$CODE" "crear viaje sin plannedHours"
+TRIP_ID_NH=$(jqr '.tripId')
+if have_sql; then
+  assert_eq "8" "$(sql "select round(extract(epoch from (planned_end - planned_start))/3600) from trips where id='$TRIP_ID_NH'")" \
+    "planned_end = planned_start + 8 h (duración asumida)"
+  assert_eq "8" "$(sql "select metadata_json->>'duracion_asumida_horas' from trips where id='$TRIP_ID_NH'")" \
+    "la duración asumida quedó registrada en metadata_json"
+  assert_eq "" "$(sql "select coalesce(metadata_json->>'duracion_asumida_horas','') from trips where id='$TRIP_ID'")" \
+    "un viaje CON duración declarada no lleva la marca de asumida"
+fi
+req POST "/api/v1/trips/$TRIP_ID_NH/complete"
+assert_status 200 "$CODE" "cierre del viaje sin duración declarada"
 
 # ---------------------------------------------------------------------
 step "14. Foto de carga"
@@ -432,8 +499,8 @@ CODE=$(curl -s -o /dev/null -w '%{http_code}' -X POST \
 assert_status 422 "$CODE" "se rechaza por tamaño"
 
 # ---------------------------------------------------------------------
-step "15. Rate limit de login (5 intentos por DNI cada 10 min)"
-RL_DNI="99999999"
+step "15. Rate limit de login (5 fallos por documento+patente en 15 min, contra base)"
+RL_DNI="9$(printf '%07d' $(( (RANDOM * 32768 + RANDOM) % 10000000 )))"
 for i in 1 2 3 4 5; do
   noauth_req POST /api/v1/mobile/login \
     "{\"documentId\":\"$RL_DNI\",\"plate\":\"$PLATE\",\"activationCode\":\"MALO$i\"}" >/dev/null
@@ -441,6 +508,24 @@ done
 noauth_req POST /api/v1/mobile/login \
   "{\"documentId\":\"$RL_DNI\",\"plate\":\"$PLATE\",\"activationCode\":\"MALO6\"}"
 assert_status 429 "$CODE" "el sexto intento se frena"
+if have_sql; then
+  RL_ROWS=$(sql "select count(*) from mobile_login_attempts where document_id='$RL_DNI'")
+  [ "$RL_ROWS" -ge 6 ] && pass "los 6 intentos (incluido el frenado) quedaron registrados ($RL_ROWS filas)" \
+    || fail "faltan registros del rate limit (hay $RL_ROWS)"
+  assert_eq "1" "$(sql "select count(*) from mobile_login_attempts where document_id='$RL_DNI' and failure_reason='rate_limited'")" \
+    "el intento frenado se registró con failure_reason='rate_limited'"
+fi
+
+step "15b. El registro de intentos JAMÁS tumba el login (tabla rota)"
+if have_sql; then
+  sql "alter table mobile_login_attempts rename to mobile_login_attempts__rota" >/dev/null
+  noauth_req POST /api/v1/mobile/login \
+    "{\"documentId\":\"$DNI\",\"plate\":\"$PLATE\",\"activationCode\":\"$ACTIVATION_CODE\"}"
+  assert_status 200 "$CODE" "con mobile_login_attempts ROTA el login responde 200 (fail-open, error en el log)"
+  sql "alter table mobile_login_attempts__rota rename to mobile_login_attempts" >/dev/null
+else
+  skip "sin PSQL: no se simula la tabla de intentos rota (solo contra local)"
+fi
 
 # ---------------------------------------------------------------------
 printf '\n%s================================%s\n' "$BOLD" "$OFF"

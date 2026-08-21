@@ -5,7 +5,7 @@ import type { NormalizedPoint } from './payload';
 import {
   DRIVER_STATE_BY_CODE,
   MOBILE_MARKER_KEY,
-  TRIP_STATUS_ACTIVE,
+  TRIP_STATUS_ACTIVE_SET,
   severityForCode,
 } from './config';
 
@@ -168,6 +168,11 @@ export async function ingestPoints(
         tripId: p.tripId,
       });
 
+      // Tracking Libre: trip_events.trip_id es NOT NULL, así que un evento
+      // SIN viaje va SOLO a telemetry (con su provider_code y Meta en
+      // raw_payload). Comportamiento correcto y deliberado, no un bug: la
+      // sesión libre no tiene entidad trip todavía (llegará con
+      // trip_type='free'; hasta entonces, telemetry ES el registro).
       if (!p.tripId || !validTrips.has(p.tripId)) continue;
 
       await insertTripEvent(client, ctx.tenantId, p);
@@ -184,8 +189,8 @@ export async function ingestPoints(
     for (const [tripId, state] of lastByTrip) {
       await client.query(
         `update trips set driver_state = $1
-          where id = $2 and tenant_id = $3 and status = $4`,
-        [state, tripId, ctx.tenantId, TRIP_STATUS_ACTIVE],
+          where id = $2 and tenant_id = $3 and status = any($4::text[])`,
+        [state, tripId, ctx.tenantId, TRIP_STATUS_ACTIVE_SET],
       );
     }
 

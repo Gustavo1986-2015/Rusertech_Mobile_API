@@ -200,7 +200,6 @@ export function validateLogin(input: unknown): Validated<LoginInput> {
 
 /** Opciones cerradas del selector de duración (FIX-2 punto 5). */
 export const PLANNED_HOURS_OPTIONS = [2, 4, 6, 10, 12] as const;
-export const PLANNED_HOURS_DEFAULT = 12;
 
 export interface CreateTripInput {
   plate: string; // vehicleId = patente
@@ -213,7 +212,9 @@ export interface CreateTripInput {
   destinationLng: number | null;
   cargoType: string | null;
   notes: string | null;
-  plannedHours: number;
+  // null = el conductor no declaró duración: trips.ts asume el fallback y lo
+  // registra en metadata_json.
+  plannedHours: number | null;
 }
 
 const str = (v: unknown): string | null =>
@@ -232,7 +233,9 @@ export function validateCreateTrip(input: unknown): Validated<CreateTripInput> {
   if (!plateRaw) return { ok: false, message: 'vehicleId (patente) es obligatorio' };
   if (!docRaw) return { ok: false, message: 'driverId (DNI) es obligatorio' };
 
-  let plannedHours = PLANNED_HOURS_DEFAULT;
+  // Declarada: debe ser del selector. Ausente: null — la duración asumida y
+  // su registro en metadata_json son responsabilidad de trips.ts.
+  let plannedHours: number | null = null;
   if (b.plannedHours !== null && b.plannedHours !== undefined) {
     if (!isFiniteNumber(b.plannedHours)) {
       return { ok: false, message: 'plannedHours debe ser numérico' };
